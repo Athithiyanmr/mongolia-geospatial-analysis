@@ -1,0 +1,22 @@
+# Example local paths for the Mongolia project
+# Copy this file to config/paths.yaml and update paths for your machine.
+
+project:
+  name: mongolia-project
+
+data:
+  raw: /path/to/mongolia/data/raw
+  processed: /path/to/mongolia/data/processed
+
+vectors:
+  mongolia_boundary: /path/to/mongolia_boundary.shp
+  aimag_boundary: /path/to/aimag_boundary.shp
+  soum_boundary: /path/to/soum_boundary.shp
+
+rasters:
+  landcover: /path/to/landcover.tif
+  solar_potential: /path/to/solar_potential.tif
+
+outputs:
+  maps: outputs/maps
+  stats: outputs/stats

@@ -1,0 +1,24 @@
+name: mongolia-project
+
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.12
+  - numpy
+  - pandas
+  - geopandas
+  - shapely
+  - pyproj
+  - rasterio
+  - fiona
+  - gdal
+  - rioxarray
+  - xarray
+  - matplotlib
+  - openpyxl
+  - pyyaml
+  - tqdm
+  - jupyterlab
+  - scikit-learn
+  - pip
