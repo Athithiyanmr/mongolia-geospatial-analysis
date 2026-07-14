@@ -65,12 +65,12 @@ with rasterio.open(GHI_RASTER) as src:
         resampling=Resampling.bilinear,
     )
 
-profile.update(dtype="float32", nodata=np.nan, compress="lzw")
+# profile.update(dtype="float32", nodata=np.nan, compress="lzw")
 
-with rasterio.open(ALIGNED_GHI, "w", **profile) as dst:
-    dst.write(ghi, 1)
+# with rasterio.open(ALIGNED_GHI, "w", **profile) as dst:
+#     dst.write(ghi, 1)
 
-print("Aligned GHI saved:", ALIGNED_GHI)
+# print("Aligned GHI saved:", ALIGNED_GHI)
 
 print("Polygonizing...")
 
