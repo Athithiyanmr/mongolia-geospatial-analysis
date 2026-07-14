@@ -1,177 +1,148 @@
 from pathlib import Path
 
+import geopandas as gpd
 import numpy as np
 import rasterio
-from rasterio.warp import reproject, Resampling
+from rasterio.features import shapes
+from rasterstats import zonal_stats
+from shapely.geometry import shape
 
 # ============================================================
 # INPUTS
 # ============================================================
 
-# Output from slope filtering
 INPUT_RASTER = Path(
     "outputs/rasters/grassland_dry_steppe_slope_lt8.tif"
 )
 
-# GHI Raster
 GHI_RASTER = Path(
     "data/raw/GHI/GHI.tif"
 )
 
-# Output raster
-OUTPUT_RASTER = Path(
-    "outputs/rasters/grassland_dry_steppe_slope_lt8_GHI45.tif"
+OUTPUT_GPKG = Path(
+    "outputs/vector/solar_candidates.gpkg"
 )
 
-# Minimum GHI threshold
+OUTPUT_SHP = Path(
+    "outputs/vector/solar_candidates.shp"
+)
+
 GHI_THRESHOLD = 4.5
 
 # ============================================================
-# READ FILTERED LAND COVER
+# READ LAND COVER
 # ============================================================
 
-print("\nReading filtered land cover raster...")
+print("\nReading raster...")
 
 with rasterio.open(INPUT_RASTER) as src:
 
-    landcover = src.read(1)
-
-    profile = src.profile.copy()
-
+    raster = src.read(1)
     transform = src.transform
     crs = src.crs
-
-    width = src.width
-    height = src.height
-
     nodata = src.nodata
 
-print(f"CRS        : {crs}")
-print(f"Resolution : {src.res}")
-print(f"Size       : {width} x {height}")
-
 # ============================================================
-# READ + ALIGN GHI
+# POLYGONIZE
 # ============================================================
 
-print("\nReading GHI raster...")
+print("Polygonizing raster...")
 
-with rasterio.open(GHI_RASTER) as ghi_src:
+mask = np.isin(raster, [2, 3])
 
-    print(f"GHI CRS        : {ghi_src.crs}")
-    print(f"GHI Resolution : {ghi_src.res}")
+features = []
 
-    ghi = np.full(
-        (height, width),
-        np.nan,
-        dtype=np.float32,
+for geom, value in shapes(
+    raster,
+    mask=mask,
+    transform=transform,
+):
+
+    features.append(
+        {
+            "geometry": shape(geom),
+            "class": int(value),
+        }
     )
 
-    reproject(
-        source=rasterio.band(ghi_src, 1),
-
-        destination=ghi,
-
-        src_transform=ghi_src.transform,
-        src_crs=ghi_src.crs,
-
-        dst_transform=transform,
-        dst_crs=crs,
-
-        dst_width=width,
-        dst_height=height,
-
-        src_nodata=ghi_src.nodata,
-        dst_nodata=np.nan,
-
-        resampling=Resampling.bilinear,
-    )
-
-# ============================================================
-# FILTER GHI
-# ============================================================
-
-print("\nApplying GHI threshold...")
-
-# Existing valid pixels
-land_mask = landcover != nodata
-
-# GHI >= 4.5
-ghi_mask = (
-    (~np.isnan(ghi))
-    &
-    (ghi >= GHI_THRESHOLD)
+gdf = gpd.GeoDataFrame(
+    features,
+    crs=crs,
 )
 
-final_mask = (
-    land_mask
-    &
-    ghi_mask
+print(f"Polygons created : {len(gdf):,}")
+
+# ============================================================
+# AREA
+# ============================================================
+
+gdf["area_m2"] = gdf.area
+gdf["area_ha"] = gdf.area / 10000
+gdf["area_km2"] = gdf.area / 1e6
+
+# ============================================================
+# MEAN GHI
+# ============================================================
+
+print("Calculating Mean GHI...")
+
+stats = zonal_stats(
+    gdf,
+    GHI_RASTER,
+    stats=["mean"],
+    nodata=None,
+)
+
+gdf["mean_ghi"] = [
+    s["mean"] for s in stats
+]
+
+# ============================================================
+# FILTER
+# ============================================================
+
+before = len(gdf)
+
+gdf = gdf[
+    gdf["mean_ghi"] >= GHI_THRESHOLD
+].copy()
+
+after = len(gdf)
+
+print(f"Remaining polygons : {after:,}")
+
+# ============================================================
+# CLASS NAMES
+# ============================================================
+
+gdf["class_name"] = gdf["class"].map(
+    {
+        2: "Grassland",
+        3: "Dry Steppe",
+    }
 )
 
 # ============================================================
-# CREATE OUTPUT
+# SAVE
 # ============================================================
 
-output = np.full(
-    landcover.shape,
-    nodata,
-    dtype=landcover.dtype,
-)
-
-output[final_mask] = landcover[final_mask]
-
-profile.update(
-    compress="lzw",
-    tiled=True,
-)
-
-OUTPUT_RASTER.parent.mkdir(
+OUTPUT_GPKG.parent.mkdir(
     parents=True,
     exist_ok=True,
 )
 
-with rasterio.open(
-    OUTPUT_RASTER,
-    "w",
-    **profile,
-) as dst:
+gdf.to_file(
+    OUTPUT_GPKG,
+    driver="GPKG",
+)
 
-    dst.write(output, 1)
+gdf.to_file(
+    OUTPUT_SHP,
+)
 
-# ============================================================
-# STATISTICS
-# ============================================================
-
-grassland_before = np.sum(landcover == 2)
-dry_steppe_before = np.sum(landcover == 3)
-
-grassland_after = np.sum(output == 2)
-dry_steppe_after = np.sum(output == 3)
-
-print("\n" + "=" * 70)
-print("GHI FILTER SUMMARY")
-print("=" * 70)
-
-print(f"Input candidate pixels      : {land_mask.sum():,}")
-print(f"GHI >= {GHI_THRESHOLD} pixels     : {ghi_mask.sum():,}")
-print(f"Final candidate pixels      : {final_mask.sum():,}")
-
-print()
-
-print(f"Grassland before filtering  : {grassland_before:,}")
-print(f"Grassland after filtering   : {grassland_after:,}")
-
-print()
-
-print(f"Dry Steppe before filtering : {dry_steppe_before:,}")
-print(f"Dry Steppe after filtering  : {dry_steppe_after:,}")
-
-print()
-
-print(f"Total remaining pixels      : {grassland_after + dry_steppe_after:,}")
-
-print("\nOutput written to:")
-print(OUTPUT_RASTER)
-
-print("=" * 70)
+print("\nDone")
+print("=" * 60)
+print(f"Input polygons : {before:,}")
+print(f"Output polygons: {after:,}")
+print(f"Saved : {OUTPUT_GPKG}")
+print(f"Saved : {OUTPUT_SHP}")
