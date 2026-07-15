@@ -13,6 +13,7 @@ from rasterio.warp import (
     Resampling,
 )
 from pyproj import CRS
+from scipy.ndimage import distance_transform_edt
 
 
 # ============================================================
@@ -29,22 +30,28 @@ AOI_PATH = Path(
     "data/raw/aoi/aoi_mn.shp"
 )
 
-# Output clipped + projected raster
-OUTPUT_RASTER = Path(
+# Output clipped + projected raster (RAW, with 255 still present)
+OUTPUT_RASTER_RAW = Path(
     "outputs/rasters/"
-    "LULC_2025_AOI_EPSG32648.tif"
+    "LULC_2025_AOI_EPSG32648_raw.tif"
 )
 
-# Output statistics CSV
+# Output clipped + projected + FILLED raster (no more 255)
+OUTPUT_RASTER_FILLED = Path(
+    "outputs/rasters/"
+    "LULC_2025_AOI_EPSG32648_filled.tif"
+)
+
+# Output statistics CSV (computed on the FILLED raster)
 OUTPUT_CSV = Path(
     "outputs/stats/"
-    "landcover_stats_AOI_epsg32648.csv"
+    "landcover_stats_AOI_epsg32648_filled.csv"
 )
 
 # Output AOI summary CSV
 OUTPUT_AOI_SUMMARY_CSV = Path(
     "outputs/stats/"
-    "aoi_area_summary_epsg32648.csv"
+    "aoi_area_summary_epsg32648_filled.csv"
 )
 
 
@@ -66,6 +73,7 @@ LULC_CLASSES = {
 
     # IMPORTANT:
     # Keep 255 as a reportable class
+    # (should be 0 pixels after fill step)
     255: "NoData",
 }
 
@@ -74,16 +82,10 @@ LULC_CLASSES = {
 # CONSTANTS
 # ============================================================
 
-# Original raster NoData value that must be measured
+# Original raster NoData value that must be measured / filled
 SOURCE_NODATA_VALUE = 255
 
 # Outside AOI value in final raster.
-#
-# We must NOT use 255 because 255 inside AOI
-# needs to be counted separately.
-#
-# Therefore output raster will use UInt16,
-# allowing 65535 as outside-AOI NoData.
 OUTSIDE_AOI_NODATA = 65535
 
 # Area CRS
@@ -119,12 +121,10 @@ def read_aoi(
             "AOI has no CRS."
         )
 
-    # Remove null geometry
     aoi = aoi[
         aoi.geometry.notnull()
     ].copy()
 
-    # Remove empty geometry
     aoi = aoi[
         ~aoi.geometry.is_empty
     ].copy()
@@ -133,10 +133,6 @@ def read_aoi(
         raise ValueError(
             "AOI contains no usable geometries."
         )
-
-    # --------------------------------------------------------
-    # Fix invalid geometry
-    # --------------------------------------------------------
 
     invalid_count = int(
         (~aoi.geometry.is_valid).sum()
@@ -153,17 +149,9 @@ def read_aoi(
             aoi.geometry.buffer(0)
         )
 
-    print(
-        f"AOI path: {aoi_path}"
-    )
-
-    print(
-        f"AOI CRS: {aoi.crs}"
-    )
-
-    print(
-        f"AOI feature count: {len(aoi)}"
-    )
+    print(f"AOI path: {aoi_path}")
+    print(f"AOI CRS: {aoi.crs}")
+    print(f"AOI feature count: {len(aoi)}")
 
     return aoi
 
@@ -177,78 +165,23 @@ def calculate_aoi_area(
 ) -> dict:
 
     """
-    Calculate exact AOI polygon area
-    after projection to EPSG:32648.
+    Calculate exact AOI polygon area after projection to EPSG:32648.
     """
 
-    # --------------------------------------------------------
-    # Reproject AOI
-    # --------------------------------------------------------
-
-    aoi_projected = aoi.to_crs(
-        AREA_CRS
-    )
-
-    # --------------------------------------------------------
-    # Dissolve all features
-    # --------------------------------------------------------
-
-    aoi_union = (
-        aoi_projected
-        .geometry
-        .union_all()
-    )
-
-    # --------------------------------------------------------
-    # Calculate area
-    # --------------------------------------------------------
-
-    area_m2 = float(
-        aoi_union.area
-    )
-
-    area_ha = (
-        area_m2
-        / 10_000
-    )
-
-    area_acres = (
-        area_m2
-        / 4046.8564224
-    )
-
-    area_km2 = (
-        area_m2
-        / 1_000_000
-    )
+    aoi_projected = aoi.to_crs(AREA_CRS)
+    aoi_union = aoi_projected.geometry.union_all()
+    area_m2 = float(aoi_union.area)
+    area_ha = area_m2 / 10_000
+    area_acres = area_m2 / 4046.8564224
+    area_km2 = area_m2 / 1_000_000
 
     print("\nAOI Vector Area")
     print("=" * 70)
-
-    print(
-        f"Area CRS: "
-        f"{AREA_CRS.to_string()}"
-    )
-
-    print(
-        f"AOI area: "
-        f"{area_m2:,.2f} m²"
-    )
-
-    print(
-        f"AOI area: "
-        f"{area_ha:,.2f} hectares"
-    )
-
-    print(
-        f"AOI area: "
-        f"{area_acres:,.2f} acres"
-    )
-
-    print(
-        f"AOI area: "
-        f"{area_km2:,.4f} km²"
-    )
+    print(f"Area CRS: {AREA_CRS.to_string()}")
+    print(f"AOI area: {area_m2:,.2f} m2")
+    print(f"AOI area: {area_ha:,.2f} hectares")
+    print(f"AOI area: {area_acres:,.2f} acres")
+    print(f"AOI area: {area_km2:,.4f} km2")
 
     return {
         "aoi_area_m2": area_m2,
@@ -270,102 +203,38 @@ def clip_raster_to_aoi(
     """
     Clip raster to AOI.
 
-    Critical logic:
-
     - Original 255 inside AOI is preserved
     - Outside AOI becomes 65535
     - Output dtype becomes uint16
-
-    This allows us to distinguish:
-
-    255   = original NoData inside AOI
-    65535 = outside AOI
     """
 
-    with rasterio.open(
-        raster_path
-    ) as src:
+    with rasterio.open(raster_path) as src:
 
         if src.crs is None:
-            raise ValueError(
-                "Raster has no CRS."
-            )
+            raise ValueError("Raster has no CRS.")
 
         print("\nOriginal Raster Information")
         print("=" * 70)
+        print(f"Raster: {raster_path}")
+        print(f"CRS: {src.crs}")
+        print(f"Resolution: {src.res}")
+        print(f"Width: {src.width}")
+        print(f"Height: {src.height}")
+        print(f"Metadata NoData: {src.nodata}")
+        print(f"Bounds: {src.bounds}")
 
-        print(
-            f"Raster: {raster_path}"
-        )
-
-        print(
-            f"CRS: {src.crs}"
-        )
-
-        print(
-            f"Resolution: {src.res}"
-        )
-
-        print(
-            f"Width: {src.width}"
-        )
-
-        print(
-            f"Height: {src.height}"
-        )
-
-        print(
-            f"Metadata NoData: {src.nodata}"
-        )
-
-        print(
-            f"Bounds: {src.bounds}"
-        )
-
-        # ----------------------------------------------------
-        # AOI to raster CRS
-        # ----------------------------------------------------
-
-        aoi_raster_crs = aoi.to_crs(
-            src.crs
-        )
-
-        # ----------------------------------------------------
-        # Union geometry
-        # ----------------------------------------------------
-
-        aoi_geometry = [
-            aoi_raster_crs
-            .geometry
-            .union_all()
-        ]
-
-        # ----------------------------------------------------
-        # Read clipped raster as MASKED ARRAY
-        # ----------------------------------------------------
+        aoi_raster_crs = aoi.to_crs(src.crs)
+        aoi_geometry = [aoi_raster_crs.geometry.union_all()]
 
         clipped_masked, clipped_transform = mask(
             dataset=src,
             shapes=aoi_geometry,
-
             crop=True,
-
-            # IMPORTANT:
-            # Return MaskedArray
             filled=False,
-
             all_touched=False,
         )
 
-        # ----------------------------------------------------
-        # Extract first band
-        # ----------------------------------------------------
-
         band = clipped_masked[0]
-
-        # ----------------------------------------------------
-        # Convert to uint16
-        # ----------------------------------------------------
 
         clipped_data = np.full(
             band.shape,
@@ -373,72 +242,25 @@ def clip_raster_to_aoi(
             dtype=np.uint16,
         )
 
-        # ----------------------------------------------------
-        # Inside AOI mask
-        # ----------------------------------------------------
+        inside_aoi_mask = ~np.ma.getmaskarray(band)
 
-        inside_aoi_mask = (
-            ~np.ma.getmaskarray(
-                band
-            )
+        clipped_data[inside_aoi_mask] = (
+            band.data[inside_aoi_mask].astype(np.uint16)
         )
 
-        # ----------------------------------------------------
-        # Copy all original values inside AOI
-        #
-        # This includes:
-        # 0-9
-        # 255
-        # ----------------------------------------------------
-
-        clipped_data[
-            inside_aoi_mask
-        ] = (
-            band.data[
-                inside_aoi_mask
-            ]
-            .astype(np.uint16)
-        )
-
-        # ----------------------------------------------------
-        # Diagnostics
-        # ----------------------------------------------------
-
-        inside_pixel_count = int(
-            inside_aoi_mask.sum()
-        )
-
+        inside_pixel_count = int(inside_aoi_mask.sum())
         nodata_255_count = int(
             np.sum(
                 inside_aoi_mask
-                & (
-                    clipped_data
-                    == SOURCE_NODATA_VALUE
-                )
+                & (clipped_data == SOURCE_NODATA_VALUE)
             )
         )
 
         print("\nClipped Raster Diagnostics")
         print("=" * 70)
-
-        print(
-            f"Inside-AOI raster pixels: "
-            f"{inside_pixel_count:,}"
-        )
-
-        print(
-            f"255 pixels inside AOI: "
-            f"{nodata_255_count:,}"
-        )
-
-        print(
-            f"Outside AOI value: "
-            f"{OUTSIDE_AOI_NODATA}"
-        )
-
-        # ----------------------------------------------------
-        # Output profile
-        # ----------------------------------------------------
+        print(f"Inside-AOI raster pixels: {inside_pixel_count:,}")
+        print(f"255 pixels inside AOI: {nodata_255_count:,}")
+        print(f"Outside AOI value: {OUTSIDE_AOI_NODATA}")
 
         profile = src.profile.copy()
 
@@ -447,31 +269,16 @@ def clip_raster_to_aoi(
                 "height": clipped_data.shape[0],
                 "width": clipped_data.shape[1],
                 "transform": clipped_transform,
-
-                # UInt16 required for 65535
                 "dtype": "uint16",
-
                 "count": 1,
-
-                # Only outside AOI is raster NoData
                 "nodata": OUTSIDE_AOI_NODATA,
             }
         )
 
-        # ----------------------------------------------------
-        # Save to memory
-        # ----------------------------------------------------
-
         memfile = MemoryFile()
 
-        with memfile.open(
-            **profile
-        ) as dst:
-
-            dst.write(
-                clipped_data,
-                1,
-            )
+        with memfile.open(**profile) as dst:
+            dst.write(clipped_data, 1)
 
         return memfile
 
@@ -485,27 +292,18 @@ def reproject_clipped_raster(
 ) -> MemoryFile:
 
     """
-    Reproject clipped categorical raster
-    to EPSG:32648.
-
-    Preserves:
-    - classes 0-9
-    - inside-AOI 255
-
-    Outside AOI:
-    - 65535
+    Reproject clipped categorical raster to EPSG:32648.
+    Preserves classes 0-9, inside-AOI 255, outside-AOI 65535.
     """
 
     with clipped_memfile.open() as src:
 
-        transform, width, height = (
-            calculate_default_transform(
-                src.crs,
-                AREA_CRS,
-                src.width,
-                src.height,
-                *src.bounds,
-            )
+        transform, width, height = calculate_default_transform(
+            src.crs,
+            AREA_CRS,
+            src.width,
+            src.height,
+            *src.bounds,
         )
 
         profile = src.profile.copy()
@@ -523,33 +321,17 @@ def reproject_clipped_raster(
 
         projected_memfile = MemoryFile()
 
-        with projected_memfile.open(
-            **profile
-        ) as dst:
+        with projected_memfile.open(**profile) as dst:
 
             reproject(
-                source=rasterio.band(
-                    src,
-                    1,
-                ),
-
-                destination=rasterio.band(
-                    dst,
-                    1,
-                ),
-
+                source=rasterio.band(src, 1),
+                destination=rasterio.band(dst, 1),
                 src_transform=src.transform,
                 src_crs=src.crs,
-
-                # Only 65535 means outside AOI
                 src_nodata=OUTSIDE_AOI_NODATA,
-
                 dst_transform=transform,
                 dst_crs=AREA_CRS,
-
                 dst_nodata=OUTSIDE_AOI_NODATA,
-
-                # Categorical raster
                 resampling=Resampling.nearest,
             )
 
@@ -557,7 +339,91 @@ def reproject_clipped_raster(
 
 
 # ============================================================
-# STEP 5: CALCULATE RASTER STATISTICS
+# STEP 5 (NEW): FILL 255 NODATA WITH NEAREST VALID NEIGHBOR
+# ============================================================
+
+def fill_nodata_nearest_neighbor(
+    projected_memfile: MemoryFile,
+) -> MemoryFile:
+
+    """
+    Fill pixels equal to SOURCE_NODATA_VALUE (255) using the
+    value of the nearest valid class pixel (0-9).
+
+    Rules:
+    - Only pixels == 255 get overwritten.
+    - Pixels == OUTSIDE_AOI_NODATA (65535) are NEVER used as a
+      fill source and are NEVER overwritten. They stay exactly
+      as they are (outside the AOI).
+    - This is true nearest-neighbor "copy the closest valid
+      pixel" filling, appropriate for categorical/class data
+      (unlike IDW-style fillnodata, which can blend classes).
+    """
+
+    with projected_memfile.open() as src:
+        data = src.read(1)
+        profile = src.profile.copy()
+
+    invalid_mask = (data == SOURCE_NODATA_VALUE)
+
+    # Valid = a real class value (not 255, not 65535)
+    valid_mask = (
+        (data != SOURCE_NODATA_VALUE)
+        & (data != OUTSIDE_AOI_NODATA)
+    )
+
+    total_invalid = int(invalid_mask.sum())
+
+    print("\nNoData Fill (nearest neighbor)")
+    print("=" * 70)
+    print(f"255 pixels to fill: {total_invalid:,}")
+
+    if total_invalid == 0:
+        print("No 255 pixels found — nothing to fill.")
+        filled_memfile = MemoryFile()
+        with filled_memfile.open(**profile) as dst:
+            dst.write(data, 1)
+        return filled_memfile
+
+    if not valid_mask.any():
+        raise ValueError(
+            "No valid class pixels available inside AOI to fill from."
+        )
+
+    # For every pixel, find the index of the nearest True (valid)
+    # pixel in valid_mask.
+    nearest_row_idx, nearest_col_idx = distance_transform_edt(
+        ~valid_mask,
+        return_distances=False,
+        return_indices=True,
+    )
+
+    filled_source = data[nearest_row_idx, nearest_col_idx]
+
+    output_data = data.copy()
+    output_data[invalid_mask] = filled_source[invalid_mask]
+
+    # Sanity check: outside-AOI pixels must be untouched
+    outside_mask = (data == OUTSIDE_AOI_NODATA)
+    assert np.array_equal(
+        output_data[outside_mask], data[outside_mask]
+    ), "Outside-AOI pixels were modified — this should never happen."
+
+    remaining_255 = int(
+        np.sum(output_data == SOURCE_NODATA_VALUE)
+    )
+    print(f"255 pixels remaining after fill: {remaining_255:,}")
+
+    filled_memfile = MemoryFile()
+
+    with filled_memfile.open(**profile) as dst:
+        dst.write(output_data, 1)
+
+    return filled_memfile
+
+
+# ============================================================
+# STEP 6: CALCULATE RASTER STATISTICS
 # ============================================================
 
 def calculate_raster_stats(
@@ -565,126 +431,46 @@ def calculate_raster_stats(
 ) -> pd.DataFrame:
 
     """
-    Calculate class areas.
-
-    Includes:
-    - classes 0-9
-    - 255 NoData inside AOI
-
-    Excludes:
-    - 65535 outside AOI
+    Calculate class areas. Excludes 65535 (outside AOI).
     """
 
     with projected_memfile.open() as src:
 
         raster = src.read(1)
-
         transform = src.transform
 
-        # ----------------------------------------------------
-        # Pixel area
-        # ----------------------------------------------------
+        pixel_width = abs(transform.a)
+        pixel_height = abs(transform.e)
+        pixel_area_m2 = pixel_width * pixel_height
 
-        pixel_width = abs(
-            transform.a
-        )
-
-        pixel_height = abs(
-            transform.e
-        )
-
-        pixel_area_m2 = (
-            pixel_width
-            * pixel_height
-        )
-
-        # ----------------------------------------------------
-        # Inside AOI
-        #
-        # Everything except 65535
-        # ----------------------------------------------------
-
-        inside_aoi_mask = (
-            raster
-            != OUTSIDE_AOI_NODATA
-        )
-
-        inside_data = raster[
-            inside_aoi_mask
-        ]
+        inside_aoi_mask = (raster != OUTSIDE_AOI_NODATA)
+        inside_data = raster[inside_aoi_mask]
 
         if inside_data.size == 0:
-            raise ValueError(
-                "No pixels found inside AOI."
-            )
-
-        # ----------------------------------------------------
-        # Unique values
-        # ----------------------------------------------------
+            raise ValueError("No pixels found inside AOI.")
 
         unique_values, counts = np.unique(
-            inside_data,
-            return_counts=True,
+            inside_data, return_counts=True
         )
 
-        # ----------------------------------------------------
-        # Build statistics
-        # ----------------------------------------------------
-
         stats = pd.DataFrame(
-            {
-                "value": unique_values,
-                "pixel_count": counts,
-            }
+            {"value": unique_values, "pixel_count": counts}
         )
 
         stats["class_name"] = (
-            stats["value"]
-            .map(LULC_CLASSES)
-            .fillna("Unknown")
+            stats["value"].map(LULC_CLASSES).fillna("Unknown")
         )
 
-        # ----------------------------------------------------
-        # Area calculations
-        # ----------------------------------------------------
+        stats["area_m2"] = stats["pixel_count"] * pixel_area_m2
+        stats["area_ha"] = stats["area_m2"] / 10_000
+        stats["area_acres"] = stats["area_m2"] / 4046.8564224
+        stats["area_km2"] = stats["area_m2"] / 1_000_000
 
-        stats["area_m2"] = (
-            stats["pixel_count"]
-            * pixel_area_m2
-        )
-
-        stats["area_ha"] = (
-            stats["area_m2"]
-            / 10_000
-        )
-
-        stats["area_acres"] = (
-            stats["area_m2"]
-            / 4046.8564224
-        )
-
-        stats["area_km2"] = (
-            stats["area_m2"]
-            / 1_000_000
-        )
-
-        # ----------------------------------------------------
-        # Percentage of rasterized AOI
-        # ----------------------------------------------------
-
-        rasterized_aoi_area_m2 = (
-            stats["area_m2"].sum()
-        )
+        rasterized_aoi_area_m2 = stats["area_m2"].sum()
 
         stats["percentage_of_rasterized_aoi"] = (
-            stats["area_m2"]
-            / rasterized_aoi_area_m2
-            * 100
+            stats["area_m2"] / rasterized_aoi_area_m2 * 100
         )
-
-        # ----------------------------------------------------
-        # Column order
-        # ----------------------------------------------------
 
         stats = stats[
             [
@@ -699,36 +485,18 @@ def calculate_raster_stats(
             ]
         ]
 
-        # ----------------------------------------------------
-        # Print raster information
-        # ----------------------------------------------------
-
         print("\nProjected Raster Information")
         print("=" * 70)
-
-        print(
-            f"CRS: {src.crs}"
-        )
-
-        print(
-            f"Resolution: {src.res}"
-        )
-
-        print(
-            f"Pixel area: "
-            f"{pixel_area_m2:.4f} m²"
-        )
-
-        print(
-            f"Inside-AOI pixel count: "
-            f"{inside_data.size:,}"
-        )
+        print(f"CRS: {src.crs}")
+        print(f"Resolution: {src.res}")
+        print(f"Pixel area: {pixel_area_m2:.4f} m2")
+        print(f"Inside-AOI pixel count: {inside_data.size:,}")
 
         return stats
 
 
 # ============================================================
-# STEP 6: SAVE PROJECTED RASTER
+# STEP 7: SAVE MEMORY RASTER
 # ============================================================
 
 def save_memory_raster(
@@ -736,42 +504,22 @@ def save_memory_raster(
     output_path: Path,
 ):
 
-    """
-    Save projected raster.
-    """
-
-    output_path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     with memfile.open() as src:
 
         profile = src.profile.copy()
+        profile.update({"driver": "GTiff", "compress": "lzw"})
 
-        profile.update(
-            {
-                "driver": "GTiff",
-                "compress": "lzw",
-            }
-        )
-
-        with rasterio.open(
-            output_path,
-            "w",
-            **profile,
-        ) as dst:
-
-            dst.write(
-                src.read()
-            )
+        with rasterio.open(output_path, "w", **profile) as dst:
+            dst.write(src.read())
 
     print("\nRaster saved to:")
     print(output_path)
 
 
 # ============================================================
-# STEP 7: CREATE AOI SUMMARY
+# STEP 8: CREATE AOI SUMMARY
 # ============================================================
 
 def create_aoi_summary(
@@ -779,97 +527,28 @@ def create_aoi_summary(
     vector_aoi_area: dict,
 ) -> pd.DataFrame:
 
-    """
-    Create summary showing:
+    rasterized_aoi_area_km2 = stats["area_km2"].sum()
 
-    - exact vector AOI area
-    - rasterized AOI area
-    - classified area
-    - 255 NoData area
-    """
-
-    # --------------------------------------------------------
-    # Rasterized AOI area
-    # ----------------------------------------------------
-
-    rasterized_aoi_area_km2 = (
-        stats["area_km2"].sum()
-    )
-
-    # --------------------------------------------------------
-    # 255 NoData
-    # ----------------------------------------------------
-
-    nodata_rows = stats[
-        stats["value"]
-        == SOURCE_NODATA_VALUE
-    ]
+    nodata_rows = stats[stats["value"] == SOURCE_NODATA_VALUE]
 
     if nodata_rows.empty:
-
         nodata_255_area_km2 = 0.0
         nodata_255_pixels = 0
-
     else:
+        nodata_255_area_km2 = float(nodata_rows["area_km2"].iloc[0])
+        nodata_255_pixels = int(nodata_rows["pixel_count"].iloc[0])
 
-        nodata_255_area_km2 = float(
-            nodata_rows[
-                "area_km2"
-            ].iloc[0]
-        )
+    classified_rows = stats[stats["value"].isin(list(range(10)))]
+    classified_area_km2 = classified_rows["area_km2"].sum()
 
-        nodata_255_pixels = int(
-            nodata_rows[
-                "pixel_count"
-            ].iloc[0]
-        )
-
-    # --------------------------------------------------------
-    # Classified area
-    # ----------------------------------------------------
-
-    classified_rows = stats[
-        stats["value"].isin(
-            list(range(10))
-        )
-    ]
-
-    classified_area_km2 = (
-        classified_rows[
-            "area_km2"
-        ].sum()
-    )
-
-    # --------------------------------------------------------
-    # Percentages
-    # ----------------------------------------------------
-
-    rasterized_total = (
-        rasterized_aoi_area_km2
-    )
+    rasterized_total = rasterized_aoi_area_km2
 
     if rasterized_total > 0:
-
-        nodata_percentage = (
-            nodata_255_area_km2
-            / rasterized_total
-            * 100
-        )
-
-        classified_percentage = (
-            classified_area_km2
-            / rasterized_total
-            * 100
-        )
-
+        nodata_percentage = nodata_255_area_km2 / rasterized_total * 100
+        classified_percentage = classified_area_km2 / rasterized_total * 100
     else:
-
         nodata_percentage = 0.0
         classified_percentage = 0.0
-
-    # --------------------------------------------------------
-    # Build summary
-    # ----------------------------------------------------
 
     summary = pd.DataFrame(
         {
@@ -877,39 +556,20 @@ def create_aoi_summary(
                 "Exact vector AOI area",
                 "Rasterized AOI area",
                 "Classified LULC area",
-                "NoData 255 area",
+                "NoData 255 area (after fill)",
             ],
-
             "area_km2": [
-                vector_aoi_area[
-                    "aoi_area_km2"
-                ],
-
+                vector_aoi_area["aoi_area_km2"],
                 rasterized_aoi_area_km2,
-
                 classified_area_km2,
-
                 nodata_255_area_km2,
             ],
-
             "pixel_count": [
                 np.nan,
-
-                int(
-                    stats[
-                        "pixel_count"
-                    ].sum()
-                ),
-
-                int(
-                    classified_rows[
-                        "pixel_count"
-                    ].sum()
-                ),
-
+                int(stats["pixel_count"].sum()),
+                int(classified_rows["pixel_count"].sum()),
                 nodata_255_pixels,
             ],
-
             "percentage_of_rasterized_aoi": [
                 np.nan,
                 100.0,
@@ -928,186 +588,80 @@ def create_aoi_summary(
 
 def main():
 
-    # --------------------------------------------------------
-    # Create folders
-    # --------------------------------------------------------
-
-    OUTPUT_RASTER.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    OUTPUT_CSV.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    OUTPUT_AOI_SUMMARY_CSV.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    OUTPUT_RASTER_RAW.parent.mkdir(parents=True, exist_ok=True)
+    OUTPUT_RASTER_FILLED.parent.mkdir(parents=True, exist_ok=True)
+    OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
+    OUTPUT_AOI_SUMMARY_CSV.parent.mkdir(parents=True, exist_ok=True)
 
     clipped_memfile = None
     projected_memfile = None
+    filled_memfile = None
 
     try:
 
-        # ====================================================
-        # 1. Read AOI
-        # ====================================================
+        aoi = read_aoi(AOI_PATH)
+        vector_aoi_area = calculate_aoi_area(aoi)
 
-        aoi = read_aoi(
-            AOI_PATH
+        clipped_memfile = clip_raster_to_aoi(
+            raster_path=RASTER_PATH, aoi=aoi
         )
 
-        # ====================================================
-        # 2. Calculate exact AOI area
-        # ====================================================
+        projected_memfile = reproject_clipped_raster(clipped_memfile)
 
-        vector_aoi_area = (
-            calculate_aoi_area(
-                aoi
-            )
-        )
-
-        # ====================================================
-        # 3. Clip raster
-        # ====================================================
-
-        clipped_memfile = (
-            clip_raster_to_aoi(
-                raster_path=RASTER_PATH,
-                aoi=aoi,
-            )
-        )
-
-        # ====================================================
-        # 4. Reproject to EPSG:32648
-        # ====================================================
-
-        projected_memfile = (
-            reproject_clipped_raster(
-                clipped_memfile
-            )
-        )
-
-        # ====================================================
-        # 5. Save raster
-        # ====================================================
-
+        # Save the RAW (pre-fill) reprojected raster too, for reference
         save_memory_raster(
-            memfile=projected_memfile,
-            output_path=OUTPUT_RASTER,
+            memfile=projected_memfile, output_path=OUTPUT_RASTER_RAW
         )
 
-        # ====================================================
-        # 6. Calculate statistics
-        # ====================================================
+        # NEW STEP: fill 255 pixels with nearest valid neighbor
+        filled_memfile = fill_nodata_nearest_neighbor(projected_memfile)
 
-        stats = calculate_raster_stats(
-            projected_memfile
+        # Save the FILLED raster (this is your final deliverable)
+        save_memory_raster(
+            memfile=filled_memfile, output_path=OUTPUT_RASTER_FILLED
         )
 
-        # ====================================================
-        # 7. Create AOI summary
-        # ====================================================
-
+        # Stats now computed on the FILLED raster
+        stats = calculate_raster_stats(filled_memfile)
         summary = create_aoi_summary(
-            stats=stats,
-            vector_aoi_area=vector_aoi_area,
+            stats=stats, vector_aoi_area=vector_aoi_area
         )
 
-        # ====================================================
-        # 8. Round outputs
-        # ====================================================
-
-        area_columns = [
-            "area_m2",
-            "area_ha",
-            "area_acres",
-        ]
-
+        area_columns = ["area_m2", "area_ha", "area_acres"]
         for column in area_columns:
+            stats[column] = stats[column].round(2)
 
-            stats[column] = (
-                stats[column]
-                .round(2)
-            )
-
-        stats["area_km2"] = (
-            stats["area_km2"]
-            .round(4)
+        stats["area_km2"] = stats["area_km2"].round(4)
+        stats["percentage_of_rasterized_aoi"] = (
+            stats["percentage_of_rasterized_aoi"].round(2)
         )
 
-        stats[
-            "percentage_of_rasterized_aoi"
-        ] = (
-            stats[
-                "percentage_of_rasterized_aoi"
-            ]
-            .round(2)
+        summary["area_km2"] = summary["area_km2"].round(4)
+        summary["percentage_of_rasterized_aoi"] = (
+            summary["percentage_of_rasterized_aoi"].round(2)
         )
 
-        summary["area_km2"] = (
-            summary["area_km2"]
-            .round(4)
-        )
-
-        summary[
-            "percentage_of_rasterized_aoi"
-        ] = (
-            summary[
-                "percentage_of_rasterized_aoi"
-            ]
-            .round(2)
-        )
-
-        # ====================================================
-        # 9. Print LULC statistics
-        # ====================================================
-
-        print("\nLULC + NoData Statistics")
+        print("\nLULC + NoData Statistics (post-fill)")
         print("=" * 130)
+        print(stats.to_string(index=False))
 
-        print(
-            stats.to_string(
-                index=False
-            )
-        )
-
-        # ====================================================
-        # 10. Print AOI summary
-        # ====================================================
-
-        print("\nAOI Area Summary")
+        print("\nAOI Area Summary (post-fill)")
         print("=" * 100)
+        print(summary.to_string(index=False))
 
-        print(
-            summary.to_string(
-                index=False
-            )
-        )
-
-        # ====================================================
-        # 11. Save CSVs
-        # ====================================================
-
-        stats.to_csv(
-            OUTPUT_CSV,
-            index=False,
-        )
-
-        summary.to_csv(
-            OUTPUT_AOI_SUMMARY_CSV,
-            index=False,
-        )
+        stats.to_csv(OUTPUT_CSV, index=False)
+        summary.to_csv(OUTPUT_AOI_SUMMARY_CSV, index=False)
 
         print("\nOutputs saved:")
-        print(OUTPUT_RASTER)
+        print(OUTPUT_RASTER_RAW)
+        print(OUTPUT_RASTER_FILLED)
         print(OUTPUT_CSV)
         print(OUTPUT_AOI_SUMMARY_CSV)
 
     finally:
+
+        if filled_memfile is not None:
+            filled_memfile.close()
 
         if projected_memfile is not None:
             projected_memfile.close()
@@ -1115,10 +669,6 @@ def main():
         if clipped_memfile is not None:
             clipped_memfile.close()
 
-
-# ============================================================
-# RUN
-# ============================================================
 
 if __name__ == "__main__":
     main()
