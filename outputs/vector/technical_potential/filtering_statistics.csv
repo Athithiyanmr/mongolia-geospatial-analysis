@@ -1,0 +1,6 @@
+filter_criteria,column,threshold,polygons_passed,polygons_removed,percent_passed,percent_removed
+Area > 5 acres (2.0234 ha),area_ha,2.02343,56932,674174,7.79,92.21
+Mean GHI > 4.2,mean_ghi,4.2,507667,223439,69.44,30.56
+Distance to substation < 10 km,min_dist_substation,10000,36091,695015,4.94,95.06
+Distance to road < 2 km,min_dist_road,2000,291149,439957,39.82,60.18
+COMBINED (ALL) - Technical Potential,N/A,N/A,2638,728468,0.36,99.64

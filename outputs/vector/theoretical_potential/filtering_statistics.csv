@@ -1,0 +1,7 @@
+filter_column,threshold_meters,polygons_passed,polygons_removed,percent_passed
+min_dist_waterbody,100,750297,4898,99.35
+min_dist_railway,200,750995,4200,99.44
+min_dist_highway,500,739563,15632,97.93
+min_dist_airport,500,755110,85,99.99
+min_dist_protected,1000,754813,382,99.95
+COMBINED (ALL),N/A,731106,24089,96.81

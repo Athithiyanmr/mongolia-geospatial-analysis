@@ -1,0 +1,35 @@
+============================================================
+THEORETICAL POTENTIAL - FILTERING SUMMARY
+============================================================
+Generated: 2026-07-20 16:49:57
+Input file: outputs\vector\grassland_dry_steppe_with_distances.gpkg
+
+FILTER CRITERIA (must pass ALL):
+------------------------------------------------------------
+  min_dist_waterbody > 100m
+  min_dist_railway > 200m
+  min_dist_highway > 500m
+  min_dist_airport > 500m
+  min_dist_protected > 1,000m
+
+RESULTS:
+------------------------------------------------------------
+  Total polygons: 755,195
+  Theoretical Potential polygons: 731,106 (96.8%)
+  Removed polygons: 24,089 (3.2%)
+
+AREA STATISTICS:
+------------------------------------------------------------
+  Total theoretical potential area: 2,801,123.05 ha (28,011.23 km²)
+
+LAND COVER DISTRIBUTION:
+------------------------------------------------------------
+  Grassland: 388,171 polygons (53.1%)
+  Dry Steppe: 342,935 polygons (46.9%)
+
+OUTPUT FILES:
+------------------------------------------------------------
+  Filtered polygons: outputs\vector\theoretical_potential\theoretical_potential_polygons.gpkg
+  Removed polygons: outputs\vector\theoretical_potential\removed_polygons.gpkg
+  Statistics CSV: outputs\vector\theoretical_potential\filtering_statistics.csv
+============================================================

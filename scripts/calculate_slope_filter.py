@@ -9,15 +9,15 @@ from rasterio.warp import reproject, Resampling
 # ============================================================
 
 LULC_RASTER = Path(
-    "outputs/rasters/LULC_2025_AOI_EPSG32648.tif"
+    "outputs/rasters/LULC_2025_AOI_EPSG32648_filled.tif"
 )
 
 SLOPE_RASTER = Path(
-    "data/raw/terrain/tov_ulaanbaatur_slope_30m.tif"
+    "data/raw/terrain/aoi_slope_30m.tif"
 )
 
 OUTPUT_RASTER = Path(
-    "outputs/rasters/grassland_dry_steppe_slope_lt8.tif"
+    "outputs/rasters/grassland_dry_steppe_slope_lt8_filled.tif"
 )
 
 # ============================================================

@@ -1,0 +1,54 @@
+============================================================
+TECHNICAL POTENTIAL (without roads) - FILTERING SUMMARY
+============================================================
+Generated: 2026-07-21 02:05:28
+Input file: outputs\vector\theoretical_potential\theoretical_potential_polygons.gpkg
+
+FILTER CRITERIA (must pass ALL):
+------------------------------------------------------------
+  Area > 5 acres (2.0234 ha)
+  Mean GHI > 4.2
+  Distance to substation < 10 km
+  Distance to road < 2 km
+
+RESULTS:
+------------------------------------------------------------
+  Total theoretical potential polygons: 731,106
+  Technical Potential polygons: 2,638 (0.4%)
+  Removed polygons: 728,468 (99.6%)
+
+AREA STATISTICS:
+------------------------------------------------------------
+  Total technical potential area: 49,381.58 ha
+  Total technical potential area: 493.82 km²
+  Total technical potential area: 122,024.43 acres
+
+GHI STATISTICS:
+------------------------------------------------------------
+  Mean GHI: 4.3395
+  Min GHI: 4.2002
+  Max GHI: 4.4942
+
+SUBSTATION DISTANCE STATISTICS:
+------------------------------------------------------------
+  Mean distance: 5945 m
+  Min distance: 53 m
+  Max distance: 10000 m
+
+ROAD DISTANCE STATISTICS:
+------------------------------------------------------------
+  Mean distance: 303 m
+  Min distance: 0 m
+  Max distance: 1992 m
+
+LAND COVER DISTRIBUTION:
+------------------------------------------------------------
+  Grassland: 1,411 polygons (53.5%)
+  Dry Steppe: 1,227 polygons (46.5%)
+
+OUTPUT FILES:
+------------------------------------------------------------
+  Filtered polygons: outputs\vector\technical_potential_without_roads\technical_potential_polygons.gpkg
+  Removed polygons: outputs\vector\technical_potential_without_roads\removed_polygons.gpkg
+  Statistics CSV: outputs\vector\technical_potential_without_roads\filtering_statistics.csv
+============================================================
