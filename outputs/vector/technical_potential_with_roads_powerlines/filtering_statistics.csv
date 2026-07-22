@@ -1,0 +1,6 @@
+filter_criteria,column,threshold,polygons_passed,percent_passed
+Area > 5 acres (2.0234 ha),area_ha,2.02343,56932,7.79
+Mean GHI > 4.2,mean_ghi,4.2,507667,69.44
+Distance to powerline < 10 km,min_dist_powerline,10000,250878,34.31
+Distance to road < 2 km,min_dist_road,2000,291149,39.82
+COMBINED (technical_potential),N/A,N/A,10188,1.39

@@ -1,0 +1,19 @@
+============================================================
+POTENTIAL AREA SUMMARY
+============================================================
+Generated: 2026-07-21 16:39:47
+
+Theoretical Potential Area: 28,011.23 km²
+Technical Potential Area:   7,153.25 km²
+Difference:                 -20,857.98 km²
+
+Top 5 classes by theoretical area:
+------------------------------------------------------------
+  Dry Steppe                    :    19,671.47 km²
+  Grassland                     :     8,339.76 km²
+
+Top 5 classes by technical area:
+------------------------------------------------------------
+  Dry Steppe                    :     5,370.67 km²
+  Grassland                     :     1,782.58 km²
+============================================================

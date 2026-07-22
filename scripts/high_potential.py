@@ -1,249 +1,325 @@
 """
-high_potential.py - Extract MPZ class areas and percentages for each polygon
-CPU version with fixed reprojection handling.
-
-Input: outputs/vector/technical_potential/technical_potential_polygons.gpkg
-MPZ raster: data/raw/LULC/MPZ_v2.tif (reprojected to EPSG:32648 if needed)
-Output: outputs/vector/technical_potential_with_mpz/
+technical_potential_mpz_analysis.py - Extract MPZ class distribution for Technical Potential polygons only
+Automatically reprojects MPZ raster to EPSG:32648 if needed.
 """
 
-import os
-# CRITICAL: Disable rasterio's disk space check BEFORE importing rasterio
-os.environ['CHECK_DISK_FREE_SPACE'] = 'FALSE'
+from __future__ import annotations
 
-from pathlib import Path
+import logging
+import os
 import warnings
-warnings.filterwarnings('ignore')
+from datetime import datetime
+from pathlib import Path
+
+warnings.filterwarnings("ignore")
+
+# ============================================
+# FIX ENVIRONMENT FOR GDAL/PROJ/rasterio
+# ============================================
+
+def _fix_conda_gdal_env() -> None:
+    """Point PROJ_LIB/GDAL_DATA at the active conda env, if any."""
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if not conda_prefix:
+        return
+
+    proj_candidates = [
+        Path(conda_prefix, "Library", "share", "proj"),
+        Path(conda_prefix, "share", "proj"),
+    ]
+    for p in proj_candidates:
+        if (p / "proj.db").exists():
+            os.environ["PROJ_LIB"] = str(p)
+            logging.info("Set PROJ_LIB to %s", p)
+            break
+
+    gdal_candidates = [
+        Path(conda_prefix, "Library", "share", "gdal"),
+        Path(conda_prefix, "share", "gdal"),
+    ]
+    for p in gdal_candidates:
+        if p.exists():
+            os.environ["GDAL_DATA"] = str(p)
+            logging.info("Set GDAL_DATA to %s", p)
+            break
+
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+_fix_conda_gdal_env()
+
+# ============================================
+# IMPORTS (single pass, no duplicates)
+# ============================================
 
 import geopandas as gpd
-import pandas as pd
 import numpy as np
-from tqdm import tqdm
+import pandas as pd
 import rasterio
-from rasterio import features
-from rasterio.warp import calculate_default_transform, reproject, Resampling
-import time
-from datetime import datetime
+from rasterio.warp import Resampling, calculate_default_transform, reproject
+from rasterstats import zonal_stats
+from tqdm import tqdm
+
+gpd.options.io_engine = "fiona"
 
 # ============================================
 # CONFIGURATION
 # ============================================
 
-INPUT_GPKG = Path("outputs/vector/technical_potential/technical_potential_polygons.gpkg")
+TECHNICAL_FILE = Path("outputs/vector/technical_potential_with_roads_powerlines/technical_potential_polygons.gpkg")
 MPZ_RASTER_ORIG = Path("data/raw/LULC/MPZ_v2.tif")
 MPZ_RASTER_REPROJ = Path("outputs/rasters/MPZ_v2_EPSG32648.tif")
+
 TARGET_CRS = "EPSG:32648"
+TARGET_RESOLUTION_M = 30  # reprojection resolution in target CRS units
 
 OUTPUT_DIR = Path("outputs/vector/technical_potential_with_mpz/")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
 OUTPUT_GPKG = OUTPUT_DIR / "technical_potential_with_mpz.gpkg"
-OUTPUT_STATS = OUTPUT_DIR / "mpz_statistics.csv"
+OUTPUT_CSV = OUTPUT_DIR / "mpz_class_distribution_technical.csv"
+OUTPUT_TABLE = OUTPUT_DIR / "mpz_class_table_technical.txt"
+OUTPUT_SUMMARY = OUTPUT_DIR / "mpz_summary_technical.txt"
+
 
 # ============================================
-# STEP 0: Determine which raster to use (skip reproj if already in target CRS)
+# STEP 0: REPROJECT MPZ RASTER IF NEEDED
 # ============================================
 
-def get_raster_crs(raster_path):
-    with rasterio.open(raster_path) as src:
-        return src.crs
+def reproject_raster(
+    src_path: Path,
+    dst_path: Path,
+    target_crs: str,
+    resolution: float = TARGET_RESOLUTION_M,
+    resampling: Resampling = Resampling.nearest,
+) -> None:
+    """Reproject raster to target CRS at a fixed resolution."""
+    logging.info("  Reprojecting %s to %s...", src_path, target_crs)
 
-# Check original raster CRS
-orig_crs = get_raster_crs(MPZ_RASTER_ORIG)
-if orig_crs == TARGET_CRS:
-    MPZ_RASTER = MPZ_RASTER_ORIG
-    print(f"  ✅ Original MPZ raster already in {TARGET_CRS}. Using original.")
-else:
-    # Check if reprojected version already exists and has correct CRS
-    if MPZ_RASTER_REPROJ.exists():
-        reproj_crs = get_raster_crs(MPZ_RASTER_REPROJ)
-        if reproj_crs == TARGET_CRS:
-            MPZ_RASTER = MPZ_RASTER_REPROJ
-            print(f"  ✅ Reprojected MPZ raster already exists: {MPZ_RASTER_REPROJ}")
-        else:
-            # Delete and re-reproject
-            MPZ_RASTER_REPROJ.unlink()
-            MPZ_RASTER = None
-    else:
-        MPZ_RASTER = None
-
-    # Reproject if needed
-    if MPZ_RASTER is None:
-        print(f"  Reprojecting {MPZ_RASTER_ORIG} to {TARGET_CRS}...")
-        with rasterio.open(MPZ_RASTER_ORIG) as src:
-            transform, width, height = calculate_default_transform(
-                src.crs, TARGET_CRS, src.width, src.height,
-                *src.bounds, resolution=src.res[0]
-            )
-            kwargs = src.meta.copy()
-            kwargs.update({
-                'crs': TARGET_CRS,
-                'transform': transform,
-                'width': width,
-                'height': height,
-                'res': (abs(transform.a), abs(transform.e))
-            })
-            MPZ_RASTER_REPROJ.parent.mkdir(parents=True, exist_ok=True)
-            with rasterio.open(MPZ_RASTER_REPROJ, 'w', **kwargs) as dst:
-                reproject(
-                    source=rasterio.band(src, 1),
-                    destination=rasterio.band(dst, 1),
-                    src_transform=src.transform,
-                    src_crs=src.crs,
-                    dst_transform=transform,
-                    dst_crs=TARGET_CRS,
-                    resampling=Resampling.nearest
-                )
-        MPZ_RASTER = MPZ_RASTER_REPROJ
-        print(f"  ✅ Reprojected raster saved to: {MPZ_RASTER}")
-
-# ============================================
-# FUNCTIONS
-# ============================================
-
-def get_raster_info(raster_path):
-    with rasterio.open(raster_path) as src:
-        return {
-            'crs': src.crs,
-            'transform': src.transform,
-            'width': src.width,
-            'height': src.height,
-            'nodata': src.nodata,
-            'bounds': src.bounds,
-            'res': src.res
-        }
-
-def extract_polygon_mpz_stats(polygon, raster_path, raster_info, class_values):
-    """Extract MPZ stats using CPU."""
-    geom = polygon.geometry
-    with rasterio.open(raster_path) as src:
-        mask = features.geometry_mask(
-            [geom],
-            out_shape=(src.height, src.width),
-            transform=src.transform,
-            all_touched=True,
-            invert=False
+    with rasterio.open(src_path) as src:
+        transform, width, height = calculate_default_transform(
+            src.crs, target_crs, src.width, src.height, *src.bounds, resolution=resolution
         )
-        data = src.read(1)
-        masked_data = data[~mask]  # pixels inside polygon
-        pixel_area_km2 = abs(src.res[0] * src.res[1]) / 1_000_000
+        kwargs = src.meta.copy()
+        kwargs.update(
+            crs=target_crs,
+            transform=transform,
+            width=width,
+            height=height,
+        )
 
-    unique, counts = np.unique(masked_data, return_counts=True)
-    total_pixels = counts.sum()
-    results = {}
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        with rasterio.open(dst_path, "w", **kwargs) as dst:
+            reproject(
+                source=rasterio.band(src, 1),
+                destination=rasterio.band(dst, 1),
+                src_transform=src.transform,
+                src_crs=src.crs,
+                dst_transform=transform,
+                dst_crs=target_crs,
+                resampling=resampling,
+            )
+    logging.info("  ✅ Reprojected raster saved to: %s", dst_path)
+
+
+def resolve_mpz_raster() -> Path:
+    """Return a path to an MPZ raster guaranteed to be in TARGET_CRS, reprojecting if needed."""
+    if MPZ_RASTER_REPROJ.exists():
+        with rasterio.open(MPZ_RASTER_REPROJ) as src:
+            if str(src.crs) == TARGET_CRS:
+                logging.info("  ✅ Reprojected MPZ raster already exists: %s", MPZ_RASTER_REPROJ)
+                return MPZ_RASTER_REPROJ
+        MPZ_RASTER_REPROJ.unlink()
+
+    with rasterio.open(MPZ_RASTER_ORIG) as src:
+        if str(src.crs) == TARGET_CRS:
+            logging.info("  ✅ Original MPZ raster already in %s", TARGET_CRS)
+            return MPZ_RASTER_ORIG
+
+    reproject_raster(MPZ_RASTER_ORIG, MPZ_RASTER_REPROJ, TARGET_CRS)
+    return MPZ_RASTER_REPROJ
+
+
+# ============================================
+# CORE EXTRACTION (rasterstats-based, windowed per feature)
+# ============================================
+
+def extract_mpz_stats(gdf: gpd.GeoDataFrame, raster_path: Path) -> tuple[pd.DataFrame, list[int]]:
+    """
+    Extract per-polygon MPZ class area (km²) and percentage using rasterstats.
+    Each polygon only reads the raster window it overlaps — no full-raster reads in a loop.
+    """
+    logging.info("\n  Extracting MPZ class statistics...")
+
+    with rasterio.open(raster_path) as src:
+        raster_crs = src.crs
+        nodata = src.nodata
+        pixel_area_km2 = abs(src.res[0] * src.res[1]) / 1_000_000
+        logging.info("  Pixel area: %.6f km²", pixel_area_km2)
+
+    if gdf.crs != raster_crs:
+        logging.info("  Reprojecting polygons to raster CRS (%s)...", raster_crs)
+        gdf_reproj = gdf.to_crs(raster_crs)
+    else:
+        gdf_reproj = gdf
+        logging.info("  ✅ CRS matched")
+
+    # Drop empty/invalid geometries so zonal_stats doesn't choke on them
+    valid_mask = gdf_reproj.geometry.notna() & ~gdf_reproj.geometry.is_empty
+    if not valid_mask.all():
+        logging.warning("  ⚠️  Skipping %d empty/invalid geometries", (~valid_mask).sum())
+
+    stats = zonal_stats(
+        gdf_reproj.geometry[valid_mask],
+        str(raster_path),
+        categorical=True,
+        nodata=nodata,
+        all_touched=True,
+    )
+
+    # Discover the full set of classes across all polygons
+    class_values = sorted({int(k) for row in stats for k in row.keys()})
+    logging.info("  MPZ classes found: %s", class_values)
+
+    records = []
+    for row in stats:
+        total_pixels = sum(row.values())
+        rec = {}
+        for val in class_values:
+            count = row.get(val, 0)
+            rec[f"mpz_{val}_km2"] = count * pixel_area_km2
+            rec[f"mpz_{val}_pct"] = (count / total_pixels * 100) if total_pixels > 0 else 0.0
+        records.append(rec)
+
+    result_df = pd.DataFrame(records, index=gdf_reproj.index[valid_mask])
+    # Re-align to original index, filling skipped rows with 0
+    result_df = result_df.reindex(gdf_reproj.index, fill_value=0.0)
+
+    return result_df, class_values
+
+
+def calculate_mpz_totals(gdf: gpd.GeoDataFrame, class_values: list[int]) -> pd.DataFrame:
+    """Calculate total area for each MPZ class across all polygons."""
+    mpz_data = []
     for val in class_values:
-        idx = np.where(unique == val)[0]
-        if len(idx) > 0:
-            count = counts[idx[0]]
-            area_km2 = count * pixel_area_km2
-            pct = (count / total_pixels) * 100 if total_pixels > 0 else 0
-        else:
-            area_km2 = 0.0
-            pct = 0.0
-        results[f'mpz_{val}_km2'] = area_km2
-        results[f'mpz_{val}_pct'] = pct
-    results['polygon_area_km2'] = polygon.geometry.area / 1_000_000
-    return results
+        km2_col, pct_col = f"mpz_{val}_km2", f"mpz_{val}_pct"
+        if km2_col in gdf.columns:
+            mpz_data.append(
+                {
+                    "mpz_class": val,
+                    "total_area_km2": gdf[km2_col].sum(),
+                    "avg_percentage": gdf[pct_col].mean(),
+                    "polygons_with_class": int((gdf[km2_col] > 0).sum()),
+                }
+            )
+    return pd.DataFrame(mpz_data)
+
+
+def write_table(mpz_totals: pd.DataFrame, total_area_km2: float, n_polygons: int, path: Path) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("=" * 80 + "\n")
+        f.write("TECHNICAL POTENTIAL - MPZ CLASS DISTRIBUTION\n")
+        f.write("=" * 80 + "\n")
+        f.write(f"Generated: {datetime.now():%Y-%m-%d %H:%M:%S}\n")
+        f.write(f"Total polygons: {n_polygons:,}\n")
+        f.write(f"Total area: {total_area_km2:,.2f} km²\n\n")
+        f.write(f"{'MPZ CLASS':<12} {'AREA (km²)':>18} {'% OF TOTAL':>15} {'POLYGONS WITH CLASS':>20}\n")
+        f.write("-" * 80 + "\n")
+        for _, row in mpz_totals.iterrows():
+            pct_of_total = (row["total_area_km2"] / total_area_km2 * 100) if total_area_km2 > 0 else 0
+            f.write(
+                f"{int(row['mpz_class']):<12} {row['total_area_km2']:>18,.2f} "
+                f"{pct_of_total:>14.1f}% {row['polygons_with_class']:>20,}\n"
+            )
+        f.write("-" * 80 + "\n")
+        f.write(f"{'TOTAL':<12} {total_area_km2:>18,.2f} {100.0:>14.1f}% {n_polygons:>20,}\n")
+        f.write("=" * 80 + "\n\n")
+        f.write("📝 NOTES:\n" + "-" * 80 + "\n")
+        f.write("  - Areas are in km²\n")
+        f.write("  - MPZ classes represent different land use/cover categories\n")
+        f.write("  - '% OF TOTAL' shows the percentage of the total Technical Potential area\n")
+        f.write("  - 'POLYGONS WITH CLASS' counts how many polygons contain each MPZ class\n")
+        f.write("=" * 80 + "\n")
+
+
+def write_summary(mpz_totals: pd.DataFrame, total_area_km2: float, n_polygons: int, path: Path) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("=" * 60 + "\nTECHNICAL POTENTIAL - MPZ SUMMARY\n" + "=" * 60 + "\n")
+        f.write(f"Generated: {datetime.now():%Y-%m-%d %H:%M:%S}\n\n")
+        f.write(f"Total Technical Potential Polygons: {n_polygons:,}\n")
+        f.write(f"Total Technical Potential Area: {total_area_km2:,.2f} km²\n\n")
+        f.write("MPZ Class Distribution:\n" + "-" * 60 + "\n")
+        for _, row in mpz_totals.iterrows():
+            pct = (row["total_area_km2"] / total_area_km2 * 100) if total_area_km2 > 0 else 0
+            f.write(f"  MPZ {int(row['mpz_class'])}: {row['total_area_km2']:>12,.2f} km² ({pct:>5.1f}%)\n")
+        f.write("=" * 60 + "\n")
+
 
 # ============================================
 # MAIN
 # ============================================
 
-print("="*60)
-print("📊 EXTRACTING MPZ CLASS STATISTICS (CPU)")
-print("="*60)
-print(f"\n📅 Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+def main() -> None:
+    logging.info("=" * 60)
+    logging.info("📊 TECHNICAL POTENTIAL - MPZ CLASS ANALYSIS")
+    logging.info("=" * 60)
+    logging.info("📅 Started: %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
-# Check inputs
-if not INPUT_GPKG.exists():
-    print(f"  ❌ Input file not found: {INPUT_GPKG}")
-    exit(1)
-if not MPZ_RASTER.exists():
-    print(f"  ❌ MPZ raster not found: {MPZ_RASTER}")
-    exit(1)
+    if not TECHNICAL_FILE.exists():
+        raise FileNotFoundError(f"Technical file not found: {TECHNICAL_FILE}")
 
-# STEP 1: Read polygons
-print("\n=== STEP 1: Reading technical potential polygons ===")
-gdf = gpd.read_file(INPUT_GPKG)
-print(f"  Loaded {len(gdf):,} polygons")
-print(f"  CRS: {gdf.crs}")
+    mpz_raster = resolve_mpz_raster()
+    if not mpz_raster.exists():
+        raise FileNotFoundError(f"MPZ raster not found: {mpz_raster}")
+    logging.info("  MPZ raster found: %s", mpz_raster)
 
-# STEP 2: Read MPZ raster info
-print("\n=== STEP 2: Reading MPZ raster ===")
-raster_info = get_raster_info(MPZ_RASTER)
-print(f"  CRS: {raster_info['crs']}")
-print(f"  Resolution: {raster_info['res']}")
-print(f"  Shape: {raster_info['width']} x {raster_info['height']}")
+    logging.info("\n=== STEP 1: Reading Technical Potential ===")
+    gdf = gpd.read_file(TECHNICAL_FILE, engine="fiona")
+    logging.info("  Technical potential polygons: %s", f"{len(gdf):,}")
+    logging.info("  CRS: %s", gdf.crs)
 
-with rasterio.open(MPZ_RASTER) as src:
-    data = src.read(1)
-    unique_values = np.unique(data)
-    if raster_info['nodata'] is not None:
-        unique_values = unique_values[unique_values != raster_info['nodata']]
-    class_values = sorted(unique_values)
-    print(f"  Unique MPZ classes found: {class_values}")
+    logging.info("\n=== STEP 2: Extracting MPZ statistics ===")
+    mpz_df, mpz_classes = extract_mpz_stats(gdf, mpz_raster)
+    for col in mpz_df.columns:
+        gdf[col] = mpz_df[col].values
+    logging.info("  ✅ MPZ statistics extracted for %s polygons", f"{len(gdf):,}")
+    logging.info("  ✅ %d MPZ classes found: %s", len(mpz_classes), mpz_classes)
 
-# STEP 3: Align CRS
-print("\n=== STEP 3: CRS alignment ===")
-if gdf.crs != raster_info['crs']:
-    print(f"  Reprojecting polygons to raster CRS ({raster_info['crs']})...")
-    gdf = gdf.to_crs(raster_info['crs'])
-else:
-    print("  ✅ CRS matched")
+    logging.info("\n=== STEP 3: Saving outputs ===")
+    gdf.to_file(OUTPUT_GPKG, driver="GPKG")
+    logging.info("  ✅ GeoPackage saved: %s", OUTPUT_GPKG)
 
-# STEP 4: Extract MPZ stats
-print("\n=== STEP 4: Extracting MPZ class areas and percentages ===")
-print(f"  Processing {len(gdf):,} polygons...")
-results_list = []
-for idx, row in tqdm(gdf.iterrows(), total=len(gdf), desc="  Processing polygons"):
-    stats = extract_polygon_mpz_stats(row, MPZ_RASTER, raster_info, class_values)
-    results_list.append(stats)
+    mpz_totals = calculate_mpz_totals(gdf, mpz_classes)
+    mpz_totals.to_csv(OUTPUT_CSV, index=False)
+    logging.info("  ✅ MPZ totals CSV saved: %s", OUTPUT_CSV)
 
-mpz_df = pd.DataFrame(results_list)
-for col in mpz_df.columns:
-    gdf[col] = mpz_df[col].values
+    logging.info("\n=== STEP 4: Creating formatted table ===")
+    total_area_km2 = gdf.geometry.area.sum() / 1_000_000
+    write_table(mpz_totals, total_area_km2, len(gdf), OUTPUT_TABLE)
+    logging.info("  ✅ Formatted table saved: %s", OUTPUT_TABLE)
 
-# STEP 5: Save output
-print("\n=== STEP 5: Saving output ===")
-gdf.to_file(OUTPUT_GPKG, driver="GPKG")
-print(f"  ✅ Saved: {OUTPUT_GPKG}")
-print(f"     Polygons: {len(gdf):,}")
-print(f"     Columns added: {len(mpz_df.columns)}")
+    logging.info("\n=== STEP 5: Creating summary ===")
+    write_summary(mpz_totals, total_area_km2, len(gdf), OUTPUT_SUMMARY)
+    logging.info("  ✅ Summary saved: %s", OUTPUT_SUMMARY)
 
-# Statistics summary
-stats_summary = []
-for val in class_values:
-    km2_col = f'mpz_{val}_km2'
-    pct_col = f'mpz_{val}_pct'
-    if km2_col in gdf.columns:
-        total_km2 = gdf[km2_col].sum()
-        mean_pct = gdf[pct_col].mean()
-        stats_summary.append({
-            'mpz_class': val,
-            'total_area_km2': total_km2,
-            'mean_percentage': mean_pct,
-            'polygons_with_class': (gdf[km2_col] > 0).sum()
-        })
-summary_df = pd.DataFrame(stats_summary)
-summary_df.to_csv(OUTPUT_STATS, index=False)
-print(f"  ✅ Statistics saved: {OUTPUT_STATS}")
+    logging.info("\n" + "=" * 60)
+    logging.info("📊 MPZ CLASS DISTRIBUTION - TECHNICAL POTENTIAL")
+    logging.info("=" * 60)
+    logging.info("  Total Technical Potential Area: %.2f km²", total_area_km2)
+    logging.info("  Total Polygons: %s", f"{len(gdf):,}")
+    logging.info("  MPZ Classes: %d\n", len(mpz_classes))
+    for _, row in mpz_totals.iterrows():
+        pct = (row["total_area_km2"] / total_area_km2 * 100) if total_area_km2 > 0 else 0
+        logging.info("    MPZ %d: %12.2f km² (%5.1f%%)", int(row["mpz_class"]), row["total_area_km2"], pct)
 
-# STEP 6: Summary
-print("\n" + "="*60)
-print("📊 MPZ STATISTICS SUMMARY")
-print("="*60)
-print(f"\nTotal technical potential polygons: {len(gdf):,}")
-print(f"Total area (from GIS): {gdf.geometry.area.sum() / 1_000_000:.2f} km²")
-print(f"Total area (sum of MPZ classes): {gdf[[f'mpz_{v}_km2' for v in class_values]].sum().sum():.2f} km²")
-print("\nClass-wise totals:")
-for val in class_values:
-    km2_col = f'mpz_{val}_km2'
-    if km2_col in gdf.columns:
-        total_km2 = gdf[km2_col].sum()
-        pct_of_total = (total_km2 / gdf.geometry.area.sum() * 1_000_000) * 100
-        print(f"  MPZ {val}: {total_km2:.2f} km² ({pct_of_total:.1f}% of total polygon area)")
+    logging.info("\n" + "=" * 60)
+    logging.info("✅ TECHNICAL POTENTIAL MPZ ANALYSIS COMPLETE!")
+    logging.info("📁 Output folder: %s", OUTPUT_DIR)
+    logging.info("   ├── %s", OUTPUT_GPKG.name)
+    logging.info("   ├── %s", OUTPUT_CSV.name)
+    logging.info("   ├── %s", OUTPUT_TABLE.name)
+    logging.info("   └── %s", OUTPUT_SUMMARY.name)
+    logging.info("=" * 60)
 
-print("\n✅ MPZ extraction complete!")
-print(f"📁 Output folder: {OUTPUT_DIR}")
-print(f"   ├── {OUTPUT_GPKG.name}")
-print(f"   └── {OUTPUT_STATS.name}")
-print("="*60)
+
+if __name__ == "__main__":
+    main()

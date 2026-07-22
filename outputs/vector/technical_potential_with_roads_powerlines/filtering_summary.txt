@@ -1,0 +1,27 @@
+============================================================
+TECHNICAL POTENTIAL - RE-APPLIED FILTERS (POWERLINE)
+============================================================
+Generated: 2026-07-21 16:28:44
+Input kept file: outputs\vector\technical_potential\technical_potential_polygons.gpkg
+Input removed file: outputs\vector\technical_potential\removed_polygons.gpkg
+
+FILTER CRITERIA (must pass ALL):
+------------------------------------------------------------
+  Area > 5 acres (2.0234 ha)
+  Mean GHI > 4.2
+  Distance to powerline < 10 km
+  Distance to road < 2 km
+
+RESULTS:
+------------------------------------------------------------
+  Total combined polygons: 731,106
+  Updated Technical Potential (kept): 10,188 (1.4%)
+  Updated Removed: 720,918 (98.6%)
+
+OUTPUT FILES:
+------------------------------------------------------------
+  Combined (with flag): outputs\vector\technical_potential_with_roads_powerlines\technical_potential_combined.gpkg
+  Kept polygons: outputs\vector\technical_potential_with_roads_powerlines\technical_potential_polygons.gpkg
+  Removed polygons: outputs\vector\technical_potential_with_roads_powerlines\removed_polygons.gpkg
+  Statistics: outputs\vector\technical_potential_with_roads_powerlines\filtering_statistics.csv
+============================================================
